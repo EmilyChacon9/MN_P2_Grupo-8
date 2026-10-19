@@ -1,0 +1,129 @@
+clear; clc; close all;
+
+rho = 1.21;  cp = 1007;  Tamb = 28;                 % aire a 25 °C [kg/m3, J/kgK, °C]
+P.C = [rho*0.0315*cp;                               % C_ca   (0.0315 m3 de aire)
+       25*(0.5*0.4*0.03)*1674;                      % C_surf (espuma 500x400x30 mm)
+       rho*0.1715*cp];                              % C_ins  (0.1715 m3 de aire)
+P.R = struct('Rhex',0.020,'Rcs',0.036,'Rsi',0.021,'Ria',0.077);  % medias [K/W]
+P.Tamb = Tamb;
+P.THex = 44.83;                                     % [°C] da T_ins = 37 °C en régimen estacionario
+A_port = 0.17*0.13;                                 % ventana de acceso 170x130 mm [m2]
+v_open = 0.10;                                      % velocidad media del aire en la apertura [m/s] (supuesto)
+P.mcp_open = rho*A_port*v_open*cp;                  % m_out*cp durante la apertura [W/K]
+P.mcp_base = 0;                                     % la fuga basal ya está incluida en R_ins-amb
+P.t_open = 60;  P.t_close = 120;                    % apertura de 60 s [s]
+Tf = 300;                                           % horizonte [s]
+
+T0 = estacionario(P, P.mcp_base);
+fprintf('Estacionario base: Tca=%.2f  Tsurf=%.2f  Tins=%.2f\n', T0);
+
+h_lista = 0.5./2.^(0:7);                            % todos dividen a 60 s (malla alineada)
+Tfrio = [28; 28; 28];
+metodos = {'heun','rk4','trapecio','euler_atras'};
+err = zeros(numel(metodos), numel(h_lista));
+for m = 1:numel(metodos)
+    for k = 1:numel(h_lista)
+        [t, T] = integrar(metodos{m}, P, Tfrio, h_lista(k), Tf);
+        Te = solucion_exacta(P, Tfrio, t);
+        err(m,k) = max(abs(T(:) - Te(:)));
+    end
+    orden = log2(err(m,1:end-1)./err(m,2:end));
+    fprintf('%-12s orden observado (último): %.2f\n', metodos{m}, orden(end));
+end
+figure; loglog(h_lista, err', '-o'); legend(metodos); grid on
+xlabel('h (s)'); ylabel('error máximo (°C)');
+
+[A, ~] = sistema(P, 0);
+lam = sort(eig(A));                                 % valores propios [1/s]
+fprintf('tau = %s s | razón de rigidez = %.1f\n', mat2str(-1./lam',3), lam(1)/lam(end));
+fprintf('h_crit Heun = %.3f s | h_crit RK4 = %.3f s\n', 2/abs(lam(1)), 2.7853/abs(lam(1)));
+
+[t, T] = integrar('rk4', P, T0, 0.1, 400);
+deficit = T0(3) - T(:,3);
+[dmax, i] = max(deficit);
+ic = round(P.t_close/0.1) + 1;
+j  = ic - 1 + find(deficit(ic:end) <= 0.1*deficit(ic), 1);
+fprintf('Descenso máximo = %.3f °C | t_rec(90%%) = %.1f s | integral = %.1f K*s\n', ...
+        dmax, t(j)-P.t_close, trapz(t, deficit));
+
+casos = {'Ria=0.043','Ria=0.116','Rsi=0.011','Rsi=0.032','Rcs=0.018','Rcs=0.055', ...
+         'Csurf-50%','Csurf+50%','Cins-20%','Cins+20%','THex-2K','THex+2K'};
+for c = 1:numel(casos)
+    Q = P;
+    switch casos{c}
+        case 'Ria=0.043', Q.R.Ria = 0.043;   case 'Ria=0.116', Q.R.Ria = 0.116;
+        case 'Rsi=0.011', Q.R.Rsi = 0.011;   case 'Rsi=0.032', Q.R.Rsi = 0.032;
+        case 'Rcs=0.018', Q.R.Rcs = 0.018;   case 'Rcs=0.055', Q.R.Rcs = 0.055;
+        case 'Csurf-50%', Q.C(2) = 0.5*Q.C(2); case 'Csurf+50%', Q.C(2) = 1.5*Q.C(2);
+        case 'Cins-20%',  Q.C(3) = 0.8*Q.C(3); case 'Cins+20%',  Q.C(3) = 1.2*Q.C(3);
+        case 'THex-2K',   Q.THex = P.THex-2;   case 'THex+2K',   Q.THex = P.THex+2;
+    end
+    Q0 = estacionario(Q, Q.mcp_base);
+    [t, T] = integrar('rk4', Q, Q0, 0.1, 400);
+    d = Q0(3) - T(:,3);  ic = round(Q.t_close/0.1) + 1;
+    j = ic - 1 + find(d(ic:end) <= 0.1*d(ic), 1);
+    fprintf('%-10s Tss=%.2f  dmax=%.3f  trec=%.1f  I=%.1f\n', casos{c}, Q0(3), max(d), t(j)-Q.t_close, trapz(t,d));
+end
+
+[t, T] = integrar('rk4', P, T0, 0.05, 250);
+figure; plot(t, T - T0', 'LineWidth', 1.2); grid on
+xlabel('t (s)'); ylabel('T - T_{previo} (°C)'); legend('T_{ca}','T_{surf}','T_{ins}');
+
+function [A, b] = sistema(P, mcp)
+    R = P.R;
+    gh = 1/(0.5*R.Rhex);  gcs = 1/R.Rcs;  gsi = 1/R.Rsi;  gia = 1/R.Ria + mcp;
+    K = [-(gh+gcs),  gcs,         0;
+          gcs,      -(gcs+gsi),   gsi;
+          0,         gsi,        -(gsi+gia)];
+    A = K ./ P.C;                                   % divide cada fila i entre C_i
+    b = [gh*P.THex; 0; gia*P.Tamb] ./ P.C;
+end
+
+function mcp = caudal(P, t)
+    if t >= P.t_open && t < P.t_close, mcp = P.mcp_open; else, mcp = P.mcp_base; end
+end
+
+function Ts = estacionario(P, mcp)
+    [A, b] = sistema(P, mcp);  Ts = -A \ b;
+end
+
+function [t, T] = integrar(metodo, P, T0, h, Tf)
+
+n = round(Tf/h);  t = (0:n)'*h;  T = zeros(n+1,3);  T(1,:) = T0(:)';  I3 = eye(3);
+    for k = 1:n
+        mcp = caudal(P, t(k) + 0.5*h);
+        [A, b] = sistema(P, mcp);
+        x = T(k,:)';
+        switch metodo
+            case 'heun'
+                k1 = A*x + b;  k2 = A*(x + h*k1) + b;
+                xn = x + 0.5*h*(k1 + k2);
+            case 'rk4'
+                k1 = A*x + b;            k2 = A*(x + 0.5*h*k1) + b;
+                k3 = A*(x + 0.5*h*k2) + b;  k4 = A*(x + h*k3) + b;
+                xn = x + h/6*(k1 + 2*k2 + 2*k3 + k4);
+            case 'trapecio'                          % (I - h/2 A) x+ = (I + h/2 A) x + h b
+                xn = (I3 - 0.5*h*A) \ ((I3 + 0.5*h*A)*x + h*b);
+            case 'euler_atras'                       % diagnóstico (L-estable)
+                xn = (I3 - h*A) \ (x + h*b);
+            otherwise
+                error('Método desconocido: %s', metodo);
+        end
+        T(k+1,:) = xn';
+    end
+end
+
+function Te = solucion_exacta(P, T0, t)
+
+ta = [0, P.t_open, P.t_close, inf];  mc = [P.mcp_base, P.mcp_open, P.mcp_base];
+    Te = zeros(numel(t),3);  x0 = T0(:);
+    for s = 1:3
+        [A, b] = sistema(P, mc(s));  Ts = -A \ b;
+        idx = find(t >= ta(s) & t < ta(s+1));
+        if s == 3, idx = find(t >= ta(s)); end
+        for q = idx(:)'
+            Te(q,:) = (Ts + expm(A*(t(q)-ta(s)))*(x0 - Ts))';
+        end
+        if s < 3, x0 = Ts + expm(A*(ta(s+1)-ta(s)))*(x0 - Ts); end
+    end
+end
